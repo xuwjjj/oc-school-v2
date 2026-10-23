@@ -11,36 +11,99 @@ const app = express();
 const PORT = Number(process.env.PORT || 4000);
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+
 app.use(helmet({ crossOriginResourcePolicy: false }));
+
+const allowedOrigins = new Set(
+  [process.env.CLIENT_URL, process.env.ALLOWED_ORIGINS]
+    .filter(Boolean)
+    .flatMap((value) => String(value).split(','))
+    .map((value) => value.trim())
+    .filter(Boolean)
+);
+
+const isLocalOrigin = (origin) => /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
-    const isLocalhost = /^http:\/\/localhost:\d+$/.test(origin) || /^http:\/\/127\.0\.0\.1:\d+$/.test(origin);
-    const allowedUrls = (process.env.CLIENT_URL || '').split(',').map(u => u.trim());
-    if (isLocalhost || allowedUrls.includes(origin) || process.env.ALLOW_ALL_ORIGINS === 'true') {
-      return callback(null, true);
-    }
-    return callback(null, true);
+    if (allowedOrigins.has(origin) || isLocalOrigin(origin)) return callback(null, true);
+    return callback(null, false);
   },
   credentials: true
 }));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '1mb' }));
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 50,
+  max: 120,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { success: false, message: 'Too many requests, try again later.' }
+  message: { success: false, message: 'طلبات كثيرة، حاول بعد قليل.' }
 });
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 15,
+  skipSuccessfulRequests: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'محاولات دخول كثيرة، حاول بعد 15 دقيقة.' }
+});
+
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'تم إنشاء عدة حسابات من هذا الجهاز، حاول لاحقاً.' }
+});
+
+const failedLogins = new Map();
+const MAX_ATTEMPTS = 5;
+const LOCK_MS = 15 * 60 * 1000;
+
+function isLocked(username) {
+  const entry = failedLogins.get(username);
+  if (!entry) return false;
+  if (Date.now() > entry.until) {
+    failedLogins.delete(username);
+    return false;
+  }
+  return entry.count >= MAX_ATTEMPTS;
+}
+
+function registerFailure(username) {
+  if (failedLogins.size > 5000) failedLogins.clear();
+  const entry = failedLogins.get(username) || { count: 0, until: 0 };
+  entry.count += 1;
+  entry.until = Date.now() + LOCK_MS;
+  failedLogins.set(username, entry);
+}
+
+function validatePassword(password) {
+  if (typeof password !== 'string') return 'كلمة المرور غير صالحة';
+  if (password.length < 8) return 'كلمة المرور يجب أن تكون 8 أحرف على الأقل';
+  if (password.length > 128) return 'كلمة المرور طويلة جداً';
+  if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+    return 'كلمة المرور يجب أن تحتوي حرفاً ورقماً على الأقل';
+  }
+  return null;
+}
 
 function dbAll(sql, params = []) {
   return db.prepare(sql).all(...params);
 }
 
+const PHOTO_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+
 function normalizePhoto(photo) {
-  if (typeof photo !== 'string' || !photo.startsWith('data:image/')) return '';
-  if (photo.length > 1500000) return '';
+  if (typeof photo !== 'string') return '';
+  const match = /^data:([a-z/+.-]+);base64,/i.exec(photo.slice(0, 60));
+  if (!match || !PHOTO_TYPES.has(match[1].toLowerCase())) return '';
+  if (photo.length > 800000) return '';
   return photo;
 }
 
@@ -78,7 +141,7 @@ app.get('/api/health', (req, res) => {
   res.json({ success: true, message: 'Server is running' });
 });
 
-app.post('/api/auth/register', authLimiter, (req, res) => {
+app.post('/api/auth/register', registerLimiter, (req, res) => {
   const {
     name,
     username,
@@ -110,23 +173,31 @@ app.post('/api/auth/register', authLimiter, (req, res) => {
     social_welfare,
     notes
   } = req.body || {};
-  if (!name || !username || !email || !password) {
+  const cleanName = String(name || '').trim();
+  const cleanUsername = String(username || '').trim();
+  const cleanEmail = String(email || '').trim().toLowerCase();
+
+  if (!cleanName || !cleanUsername || !cleanEmail || !password) {
     return res.status(400).json({ success: false, message: 'الاسم واسم المستخدم والبريد وكلمة المرور مطلوبة' });
   }
-  if (password.length < 6) {
-    return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
+  if (!/^[\p{L}\p{N}_.-]{3,32}$/u.test(cleanUsername)) {
+    return res.status(400).json({ success: false, message: 'اسم المستخدم يجب أن يكون بين 3 و32 حرفاً بدون مسافات' });
   }
-  if (findUserByUsername(username)) {
-    return res.status(409).json({ success: false, message: 'Username already exists' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
+    return res.status(400).json({ success: false, message: 'البريد الإلكتروني غير صالح' });
   }
-  if (findUserByEmail(email)) {
-    return res.status(409).json({ success: false, message: 'Email already exists' });
+  const passwordError = validatePassword(password);
+  if (passwordError) {
+    return res.status(400).json({ success: false, message: passwordError });
+  }
+  if (findUserByUsername(cleanUsername) || findUserByEmail(cleanEmail)) {
+    return res.status(409).json({ success: false, message: 'اسم المستخدم أو البريد الإلكتروني مستخدم مسبقاً' });
   }
   if (national_id && db.prepare('SELECT id FROM students WHERE national_id = ?').get(national_id)) {
     return res.status(409).json({ success: false, message: 'رقم البطاقة الوطنية الموحدة مسجل مسبقاً' });
   }
 
-  const user = createUser({ name, username, email, password, role: 'student' });
+  const user = createUser({ name: cleanName, username: cleanUsername, email: cleanEmail, password, role: 'student' });
   db.prepare(`
     INSERT INTO students (
       name, grade_level, guardian_name, guardian_phone, status, user_id,
@@ -135,7 +206,7 @@ app.post('/api/auth/register', authLimiter, (req, res) => {
       special_needs, city, district, neighborhood, alley, landmark, living_standard, social_welfare, notes
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    name,
+    cleanName,
     grade_level || 'غير محدد',
     '',
     '',
@@ -171,11 +242,16 @@ app.post('/api/auth/register', authLimiter, (req, res) => {
   return res.status(201).json({ success: true, token, user });
 });
 
-app.post('/api/auth/login', authLimiter, (req, res) => {
+app.post('/api/auth/login', loginLimiter, (req, res) => {
   const { username, password } = req.body || {};
   const identifier = String(username || '').trim();
   if (!identifier || !password) {
     return res.status(400).json({ success: false, message: 'اسم المستخدم وكلمة المرور مطلوبان' });
+  }
+
+  const attemptKey = identifier.toLowerCase();
+  if (isLocked(attemptKey)) {
+    return res.status(429).json({ success: false, message: 'الحساب مقفل مؤقتاً بعد محاولات فاشلة. حاول بعد 15 دقيقة.' });
   }
 
   let user = findUserByUsername(identifier);
@@ -184,8 +260,11 @@ app.post('/api/auth/login', authLimiter, (req, res) => {
   }
 
   if (!user || !user.password_hash || !comparePassword(password, user.password_hash)) {
+    registerFailure(attemptKey);
     return res.status(401).json({ success: false, message: 'بيانات الدخول غير صحيحة' });
   }
+
+  failedLogins.delete(attemptKey);
 
   const token = issueToken(user);
   return res.json({ success: true, token, user: { id: user.id, name: user.name, username: user.username, email: user.email, role: user.role } });
@@ -367,12 +446,21 @@ app.put('/api/students/:id', requireAuth, requireRole('admin', 'teacher'), (req,
   res.json({ success: true, student: db.prepare('SELECT * FROM students WHERE id = ?').get(req.params.id) });
 });
 
-app.delete('/api/students/:id', requireAuth, requireRole('admin', 'teacher'), (req, res) => {
-  db.prepare('DELETE FROM students WHERE id = ?').run(req.params.id);
-  db.prepare('DELETE FROM attendance WHERE student_id = ?').run(req.params.id);
-  db.prepare('DELETE FROM grades WHERE student_id = ?').run(req.params.id);
+app.delete('/api/students/:id', requireAuth, requireRole('admin'), (req, res) => {
+  const student = db.prepare('SELECT id, user_id FROM students WHERE id = ?').get(req.params.id);
+  if (!student) {
+    return res.status(404).json({ success: false, message: 'الطالب غير موجود' });
+  }
+
+  db.prepare('DELETE FROM attendance WHERE student_id = ?').run(student.id);
+  db.prepare('DELETE FROM grades WHERE student_id = ?').run(student.id);
+  db.prepare('DELETE FROM students WHERE id = ?').run(student.id);
+  if (student.user_id) {
+    db.prepare("DELETE FROM users WHERE id = ? AND role = 'student'").run(student.user_id);
+  }
+
   db.save();
-  res.json({ success: true, message: 'Student deleted' });
+  res.json({ success: true, message: 'تم حذف الطالب وحسابه' });
 });
 
 app.get('/api/attendance', requireAuth, requireRole('admin', 'teacher'), (req, res) => {

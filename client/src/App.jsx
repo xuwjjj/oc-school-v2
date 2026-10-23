@@ -1085,7 +1085,7 @@ function App() {
                 <div className="enroll-grid">
                   <label>اسم المستخدم<input value={form.username} onChange={(e) => updateForm('username', e.target.value)} required /></label>
                   <label>البريد الإلكتروني<input type="email" value={form.email} onChange={(e) => updateForm('email', e.target.value)} required /></label>
-                  <label className="full">كلمة المرور<input type="password" value={form.password} onChange={(e) => updateForm('password', e.target.value)} required minLength={6} /></label>
+                  <label className="full">كلمة المرور<input type="password" value={form.password} onChange={(e) => updateForm('password', e.target.value)} required minLength={8} pattern="(?=.*[A-Za-z])(?=.*\d).{8,}" title="8 أحرف على الأقل وتحتوي حرفاً ورقماً" placeholder="8 أحرف على الأقل، تحتوي حرفاً ورقماً" /></label>
                 </div>
               </section>
 

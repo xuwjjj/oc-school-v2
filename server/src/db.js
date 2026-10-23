@@ -186,6 +186,12 @@ if (!tableColumns('users').includes('password_hash')) {
   ['notes', 'TEXT']
 ].forEach(([column, definition]) => ensureColumn('students', column, definition));
 
+try {
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_students_national_id ON students(national_id) WHERE national_id IS NOT NULL AND national_id <> ''");
+} catch (error) {
+  console.warn('تعذر إنشاء فهرس فريد للرقم الوطني (توجد قيم مكررة):', error.message);
+}
+
 db.save();
 
 const adminUsername = process.env.ADMIN_USERNAME;
@@ -193,6 +199,10 @@ const adminPassword = process.env.ADMIN_PASSWORD;
 
 if (Boolean(adminUsername) !== Boolean(adminPassword)) {
   throw new Error('ADMIN_USERNAME and ADMIN_PASSWORD must both be configured');
+}
+
+if (adminPassword && (adminPassword.length < 8 || !/[A-Za-z]/.test(adminPassword) || !/[0-9]/.test(adminPassword))) {
+  console.warn('⚠️ تحذير أمني: كلمة مرور المشرف ضعيفة. استخدم 8 أحرف على الأقل مع حرف ورقم.');
 }
 
 if (adminUsername && adminPassword) {
